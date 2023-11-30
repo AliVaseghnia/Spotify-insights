@@ -196,7 +196,14 @@ def check_and_create_sql_table(sql_table_name):
                 logging.info(f"Table '{sql_table_name}' already exists.")
             except Exception as e:
                 logging.info(f"Table '{sql_table_name}' does not exist. Creating table...")
-                create_table_query = text(f"CREATE TABLE {sql_table_name} (id INT IDENTITY(1,1) PRIMARY KEY, json_column NVARCHAR(MAX) NOT NULL)")
+                create_table_query = text(f"""
+                    CREATE TABLE {sql_table_name} (
+                        id INT IDENTITY(1,1) PRIMARY KEY,
+                        json_column NVARCHAR(MAX) NOT NULL,
+                        created_at DATETIME2 NOT NULL DEFAULT GETDATE(),
+                        updated_at DATETIME2 NOT NULL DEFAULT GETDATE()
+                    )
+                """)
                 connection.execute(create_table_query)
                 logging.info(f"Table '{sql_table_name}' created successfully.")
     except Exception as e:
@@ -210,6 +217,7 @@ def load_data_to_sql(container_name, blob_name, sql_table_name, json_key_column)
 
     json_data = blob_client.download_blob().readall()
 
+    logging.info(f"BLOB NAME: {blob_name}")
     # Parse JSON data
     data_objects = json.loads(json_data.decode('utf-8'))
 
@@ -227,7 +235,10 @@ def load_data_to_sql(container_name, blob_name, sql_table_name, json_key_column)
                 for data_object in data_objects:
                     if isinstance(data_object, dict):
                         obj_json_data = json.dumps(data_object)
-                        insert_query = text(f"INSERT INTO {sql_table_name} (json_column) VALUES (:json_data)")
+                        insert_query = text(f"""
+                            INSERT INTO {sql_table_name} (json_column, created_at, updated_at)
+                            VALUES (:json_data, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                            """)
                         connection.execute(insert_query, json_data=obj_json_data)
             else:  # If table is not empty, use MERGE
                 for data_object in data_objects:
@@ -240,12 +251,13 @@ def load_data_to_sql(container_name, blob_name, sql_table_name, json_key_column)
                             USING (SELECT :unique_key_value AS unique_key, :json_data AS json_column) AS source
                             ON JSON_VALUE(target.json_column, '$.{json_key_column}') = source.unique_key
                             WHEN MATCHED THEN
-                                UPDATE SET target.json_column = source.json_column
+                                UPDATE SET 
+                                    target.json_column = source.json_column,
+                                    target.updated_at = CURRENT_TIMESTAMP
                             WHEN NOT MATCHED THEN
-                                INSERT (json_column)
-                                VALUES (source.json_column);
+                                INSERT (json_column, created_at, updated_at)
+                                VALUES (source.json_column, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
                         """)
-
                         connection.execute(merge_query, unique_key_value=unique_key_value, json_data=obj_json_data)
     except Exception as e:
         logging.error(f"An error occurred while loading data to Azure SQL Database: {e}")
@@ -262,7 +274,7 @@ default_args = {
 }
 
 dag = DAG(
-    'hello_spotify_dag_api',
+    'fetch_spotify_data_api',
     default_args=default_args,
     description='A simple DAG to test Spotify API',
     schedule_interval=timedelta(days=1),
@@ -342,7 +354,8 @@ load_top_tracks_to_sql_task = PythonOperator(
     op_kwargs={
         'container_name': 'spotify-data',
         'blob_name': '{{ task_instance.xcom_pull(task_ids="upload_top_tracks_to_blob") }}',
-        'sql_table_name': 'top_tracks'
+        'sql_table_name': 'top_tracks',
+        'json_key_column': 'id'
     },
     dag=dag,
 )
