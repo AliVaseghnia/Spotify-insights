@@ -7,7 +7,9 @@ WITH source_data AS (
         JSON_VALUE(tt.json_column, '$.explicit') AS track_is_explicit,
         JSON_VALUE(tt.json_column, '$.popularity') AS track_popularity,
         a.id AS artist_id,
-        a.name AS artist_name
+        a.name AS artist_name,
+        created_at,
+        updated_at,
     FROM dbo.top_tracks tt
     CROSS APPLY OPENJSON(tt.json_column, '$.artists') WITH (
         [id] NVARCHAR(MAX) '$.id',
