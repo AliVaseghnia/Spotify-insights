@@ -310,6 +310,20 @@ upload_to_blob_task = PythonOperator(
     dag=dag,
 )
 
+# Task for uploading top tracks data to Blob
+upload_top_tracks_to_blob_task = PythonOperator(
+    task_id='upload_top_tracks_to_blob',
+    python_callable=upload_to_blob,
+    op_kwargs={
+        'data': '{{ task_instance.xcom_pull(task_ids="fetch_artists_top_tracks") }}',  # Ensure this task_id matches your fetch task
+        'container_name': 'spotify-data',
+        'endpoint_name': 'top-tracks',
+        'blob_name': 'top-tracks.json'  # This blob name can be set dynamically in your function
+    },
+    dag=dag,
+)
+
+
 load_data_to_sql_task = PythonOperator(
     task_id='load_data_to_sql',
     python_callable=load_data_to_sql,
@@ -322,11 +336,32 @@ load_data_to_sql_task = PythonOperator(
     dag=dag,
 )
 
+load_top_tracks_to_sql_task = PythonOperator(
+    task_id='load_top_tracks_to_sql',
+    python_callable=load_data_to_sql,
+    op_kwargs={
+        'container_name': 'spotify-data',
+        'blob_name': '{{ task_instance.xcom_pull(task_ids="upload_top_tracks_to_blob") }}',
+        'sql_table_name': 'top_tracks'
+    },
+    dag=dag,
+)
+
+
 check_and_create_sql_table_task = PythonOperator(
     task_id='check_and_create_sql_table',
     python_callable=check_and_create_sql_table,
     op_kwargs={
         'sql_table_name': 'new_releases'
+    },
+    dag=dag,
+)
+
+check_and_create_top_tracks_table_task = PythonOperator(
+    task_id='check_and_create_top_tracks_table',
+    python_callable=check_and_create_sql_table,
+    op_kwargs={
+        'sql_table_name': 'top_tracks'
     },
     dag=dag,
 )
