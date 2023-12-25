@@ -20,6 +20,7 @@ from sqlalchemy.sql import text
 AZURE_CONNECTION_STRING = conf.get('azure', 'blob_storage_conn_string')
 
 def fetch_spotify_data_api(endpoint):
+    
     logging.info(f"Starting to fetch Spotify data from {endpoint}")
 
     client_id = conf.get('spotify', 'client_id')
@@ -53,32 +54,85 @@ def fetch_spotify_data_api(endpoint):
 
     access_token = response_data['access_token']
 
-    results = []
-    next_page_url = f"https://api.spotify.com/v1/{endpoint}"
+    # Case 1: Fetch new releases
+    
+    new_releases_url = f"https://api.spotify.com/v1/{endpoint}"
+    new_releases_response = requests.get(new_releases_url, headers={"Authorization": f"Bearer {access_token}"})
+    if new_releases_response.status_code != 200:
+        logging.error(f"Failed to fetch new releases. Status Code: {new_releases_response.status_code}")
+            
 
-    while next_page_url:
-        headers = {
-            "Authorization": f"Bearer {access_token}"
-        }
-        api_response = requests.get(next_page_url, headers=headers)
-        # logging.info(f"Response: {api_response.text}")
+        new_releases_data = new_releases_response.json()
+        albums = new_releases_data.get('albums', {}).get('items', [])
+        artist_ids = set(album['artists'][0]['id'] for album in albums if album.get('artists'))
+        
+        # Push artist IDs to XCom
+        task_instance = kwargs['ti']
+        task_instance.xcom_push(key='artist_ids', value=list(artist_ids))
+        return json.dumps(albums)
 
-        if api_response.status_code != 200:
-            logging.error(f"Failed to fetch data from endpoint {endpoint}. Status Code: {api_response.status_code}")
-            return results
 
-        data = api_response.json()
-        # logging.info(f"data is: {data}")
-        albums = data.get('albums', {})
-        results.extend(albums.get('items', []))
+def fetch_artists_top_tracks(endpoint, **kwargs):
+    
+    logging.info(f"Starting to fetch Spotify data from {endpoint}")
 
-        # Check if there is a next page
-        next_page_url = albums.get('next')
+    client_id = conf.get('spotify', 'client_id')
+    client_secret = conf.get('spotify', 'client_secret')
 
-    # logging.info(f"Results type: {type(results)}") # list
-    logging.info(f"Completed fetching data from {endpoint}")
-    return json.dumps(results)
+    if not client_id or not client_secret:
+        logging.error("Client ID or Client Secret is not set. Please check your Airflow Variables.")
+        return
 
+    # Encoding client credentials
+    encoded_credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+
+    # Get the token
+    headers = {
+        "Authorization": f"Basic {encoded_credentials}"
+    }
+    payload = {
+        "grant_type": "client_credentials"
+    }
+    response = requests.post("https://accounts.spotify.com/api/token", headers=headers, data=payload)
+
+    if response.status_code != 200:
+        logging.error(f"Failed to get access token from Spotify API. Status Code: {response.status_code}")
+        return
+
+    response_data = response.json()
+
+    if 'access_token' not in response_data:
+        logging.error("Access token not found in the response.")
+        return
+
+    access_token = response_data['access_token']
+    
+    
+    task_instance = kwargs.get('ti')
+    artist_ids = task_instance.xcom_pull(task_ids='fetch_spotify_data_api', key='artist_ids')
+    market='ES'
+    if not artist_ids:
+        logging.error("No artist IDs found.")
+        return
+   
+    # Fetch new releases to get artist IDs
+    new_releases_response = requests.get("https://api.spotify.com/v1/browse/new-releases", headers={"Authorization": f"Bearer {access_token}"})
+    new_releases_data = new_releases_response.json()
+    albums = new_releases_data.get('albums', {}).get('items', [])
+        
+
+    # Fetch top tracks for each artist
+    artist_top_tracks = []
+    for artist_id in artist_ids:
+        top_tracks_url = f"https://api.spotify.com/v1/artists/{artist_id}/top-tracks?market=US"
+        top_tracks_response = requests.get(top_tracks_url, headers={"Authorization": f"Bearer {access_token}"})
+        if top_tracks_response.status_code == 200:
+            top_tracks_data = top_tracks_response.json().get('tracks', [])
+            artist_top_tracks.extend(top_tracks_data)
+        else:
+            logging.error(f"Failed to fetch top tracks for artist {artist_id}. Status Code: {top_tracks_response.status_code}")
+
+    return json.dumps(artist_top_tracks)
 
 
 def check_and_create_container(connection_string, container_name):
@@ -142,7 +196,14 @@ def check_and_create_sql_table(sql_table_name):
                 logging.info(f"Table '{sql_table_name}' already exists.")
             except Exception as e:
                 logging.info(f"Table '{sql_table_name}' does not exist. Creating table...")
-                create_table_query = text(f"CREATE TABLE {sql_table_name} (id INT IDENTITY(1,1) PRIMARY KEY, json_column NVARCHAR(MAX) NOT NULL)")
+                create_table_query = text(f"""
+                    CREATE TABLE {sql_table_name} (
+                        id INT IDENTITY(1,1) PRIMARY KEY,
+                        json_column NVARCHAR(MAX) NOT NULL,
+                        created_at DATETIME2 NOT NULL DEFAULT GETDATE(),
+                        updated_at DATETIME2 NOT NULL DEFAULT GETDATE()
+                    )
+                """)
                 connection.execute(create_table_query)
                 logging.info(f"Table '{sql_table_name}' created successfully.")
     except Exception as e:
@@ -156,6 +217,7 @@ def load_data_to_sql(container_name, blob_name, sql_table_name, json_key_column)
 
     json_data = blob_client.download_blob().readall()
 
+    logging.info(f"BLOB NAME: {blob_name}")
     # Parse JSON data
     data_objects = json.loads(json_data.decode('utf-8'))
 
@@ -173,7 +235,10 @@ def load_data_to_sql(container_name, blob_name, sql_table_name, json_key_column)
                 for data_object in data_objects:
                     if isinstance(data_object, dict):
                         obj_json_data = json.dumps(data_object)
-                        insert_query = text(f"INSERT INTO {sql_table_name} (json_column) VALUES (:json_data)")
+                        insert_query = text(f"""
+                            INSERT INTO {sql_table_name} (json_column, created_at, updated_at)
+                            VALUES (:json_data, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                            """)
                         connection.execute(insert_query, json_data=obj_json_data)
             else:  # If table is not empty, use MERGE
                 for data_object in data_objects:
@@ -186,12 +251,13 @@ def load_data_to_sql(container_name, blob_name, sql_table_name, json_key_column)
                             USING (SELECT :unique_key_value AS unique_key, :json_data AS json_column) AS source
                             ON JSON_VALUE(target.json_column, '$.{json_key_column}') = source.unique_key
                             WHEN MATCHED THEN
-                                UPDATE SET target.json_column = source.json_column
+                                UPDATE SET 
+                                    target.json_column = source.json_column,
+                                    target.updated_at = CURRENT_TIMESTAMP
                             WHEN NOT MATCHED THEN
-                                INSERT (json_column)
-                                VALUES (source.json_column);
+                                INSERT (json_column, created_at, updated_at)
+                                VALUES (source.json_column, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
                         """)
-
                         connection.execute(merge_query, unique_key_value=unique_key_value, json_data=obj_json_data)
     except Exception as e:
         logging.error(f"An error occurred while loading data to Azure SQL Database: {e}")
@@ -208,7 +274,7 @@ default_args = {
 }
 
 dag = DAG(
-    'hello_spotify_dag_api',
+    'fetch_spotify_data_api',
     default_args=default_args,
     description='A simple DAG to test Spotify API',
     schedule_interval=timedelta(days=1),
@@ -220,6 +286,17 @@ fetch_spotify_data_task = PythonOperator(
     op_kwargs={
         'endpoint': 'browse/new-releases'
     },
+    dag=dag,
+)
+
+fetch_artists_top_tracks_task = PythonOperator(
+    task_id='fetch_artists_top_tracks',
+    python_callable=fetch_artists_top_tracks,
+    op_kwargs={
+        'endpoint': 'artist_top_tracks'
+    },
+    provide_context=True,  # Important to enable XComs
+
     dag=dag,
 )
 
@@ -245,6 +322,20 @@ upload_to_blob_task = PythonOperator(
     dag=dag,
 )
 
+# Task for uploading top tracks data to Blob
+upload_top_tracks_to_blob_task = PythonOperator(
+    task_id='upload_top_tracks_to_blob',
+    python_callable=upload_to_blob,
+    op_kwargs={
+        'data': '{{ task_instance.xcom_pull(task_ids="fetch_artists_top_tracks") }}',  # Ensure this task_id matches your fetch task
+        'container_name': 'spotify-data',
+        'endpoint_name': 'top-tracks',
+        'blob_name': 'top-tracks.json'  # This blob name can be set dynamically in your function
+    },
+    dag=dag,
+)
+
+
 load_data_to_sql_task = PythonOperator(
     task_id='load_data_to_sql',
     python_callable=load_data_to_sql,
@@ -257,11 +348,33 @@ load_data_to_sql_task = PythonOperator(
     dag=dag,
 )
 
+load_top_tracks_to_sql_task = PythonOperator(
+    task_id='load_top_tracks_to_sql',
+    python_callable=load_data_to_sql,
+    op_kwargs={
+        'container_name': 'spotify-data',
+        'blob_name': '{{ task_instance.xcom_pull(task_ids="upload_top_tracks_to_blob") }}',
+        'sql_table_name': 'top_tracks',
+        'json_key_column': 'id'
+    },
+    dag=dag,
+)
+
+
 check_and_create_sql_table_task = PythonOperator(
     task_id='check_and_create_sql_table',
     python_callable=check_and_create_sql_table,
     op_kwargs={
         'sql_table_name': 'new_releases'
+    },
+    dag=dag,
+)
+
+check_and_create_top_tracks_table_task = PythonOperator(
+    task_id='check_and_create_top_tracks_table',
+    python_callable=check_and_create_sql_table,
+    op_kwargs={
+        'sql_table_name': 'top_tracks'
     },
     dag=dag,
 )
@@ -278,4 +391,11 @@ dbt_test = BashOperator(
     dag=dag,
 )
 
-fetch_spotify_data_task >> check_and_create_container_task >> upload_to_blob_task >> check_and_create_sql_table_task >> load_data_to_sql_task >> dbt_run >> dbt_test
+# New Releases Data Flow
+fetch_spotify_data_task >> check_and_create_container_task >> upload_to_blob_task >> check_and_create_sql_table_task >> load_data_to_sql_task
+
+# Top Tracks Data Flow (dependent on fetch_spotify_data_task via XCom)
+fetch_artists_top_tracks_task >> upload_top_tracks_to_blob_task >> check_and_create_top_tracks_table_task >> load_top_tracks_to_sql_task
+
+# DBT tasks should start after both data flows have been completed
+[load_data_to_sql_task, load_top_tracks_to_sql_task] >> dbt_run >> dbt_test

@@ -17,7 +17,9 @@ SELECT
     jc.release_date_precision,
     a.id AS artists_id,
     a.name AS artist_name,
-    a.type AS artist_type
+    a.type AS artist_type,
+    created_at,
+    updated_at
 
 FROM dbo.new_releases nr
 CROSS APPLY OPENJSON(nr.json_column)
